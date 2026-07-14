@@ -111,56 +111,55 @@ def list_jobs(ctx: click.Context, queue: str, from_date: str | None, now: bool) 
             )
             sys.exit(1)
 
-    session: boto3.Session = ctx.obj["session"]
-    batch = session.client("batch")
+    with console.status(f"Getting jobs for [italic]{queue}[/italic]..."):
+        session: boto3.Session = ctx.obj["session"]
+        batch = session.client("batch")
 
-    # Determine which statuses to query
-    if now:
-        statuses = ["RUNNING"]
-    else:
-        statuses = BATCH_STATUSES
-
-    try:
-        jobs: list[dict[str, Any]] = []
-        for status in statuses:
-            jobs.extend(
-                _paginate_batch(
-                    batch,
-                    "list_jobs",
-                    "jobSummaryList",
-                    jobQueue=queue,
-                    jobStatus=status,
-                )
-            )
-    except botocore.exceptions.ClientError as e:
-        code = e.response["Error"]["Code"]
-        if code in ("InvalidJobQueueException",):
-            console.print(
-                f"[bold red]Error:[/bold red] Job queue '{queue}' does not exist"
-            )
+        # Determine which statuses to query
+        if now:
+            statuses = ["RUNNING"]
         else:
-            console.print(
-                f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
+            statuses = BATCH_STATUSES
+
+        try:
+            jobs: list[dict[str, Any]] = []
+            for status in statuses:
+                jobs.extend(
+                    _paginate_batch(
+                        batch,
+                        "list_jobs",
+                        "jobSummaryList",
+                        jobQueue=queue,
+                        jobStatus=status,
+                    )
+                )
+        except botocore.exceptions.ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("InvalidJobQueueException",):
+                console.print(
+                    f"[bold red]Error:[/bold red] Job queue '{queue}' does not exist"
+                )
+            else:
+                console.print(
+                    f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
+                )
+            sys.exit(1)
+
+        # Apply date filter client-side
+        if from_dt is not None:
+            jobs = [j for j in jobs if _ms_to_utc(j["createdAt"]) >= from_dt]
+
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Job name")
+        table.add_column("Created at")
+        table.add_column("Status")
+
+        for job in jobs:
+            table.add_row(
+                job["jobName"],
+                _ms_to_utc(job["createdAt"]).isoformat(),
+                job["status"],
             )
-        sys.exit(1)
-
-    # Apply date filter client-side
-    if from_dt is not None:
-        jobs = [j for j in jobs if _ms_to_utc(j["createdAt"]) >= from_dt]
-
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Job Name")
-    table.add_column("Job ID")
-    table.add_column("Status")
-    table.add_column("Created At")
-
-    for job in jobs:
-        table.add_row(
-            job["jobName"],
-            job["jobId"],
-            job["status"],
-            _ms_to_utc(job["createdAt"]).isoformat(),
-        )
 
     console.print(table)
 
@@ -185,90 +184,92 @@ def show_log(ctx: click.Context, job_name: str, queue: str) -> None:
         console.print("[bold red]Error:[/bold red] --queue cannot be an empty string")
         sys.exit(1)
 
-    session: boto3.Session = ctx.obj["session"]
-    batch = session.client("batch")
+    with console.status("Getting log..."):
 
-    try:
-        jobs: list[dict[str, Any]] = []
-        for status in BATCH_STATUSES:
-            jobs.extend(
-                _paginate_batch(
-                    batch,
-                    "list_jobs",
-                    "jobSummaryList",
-                    jobQueue=queue,
-                    jobStatus=status,
+        session: boto3.Session = ctx.obj["session"]
+        batch = session.client("batch")
+
+        try:
+            jobs: list[dict[str, Any]] = []
+            for status in BATCH_STATUSES:
+                jobs.extend(
+                    _paginate_batch(
+                        batch,
+                        "list_jobs",
+                        "jobSummaryList",
+                        jobQueue=queue,
+                        jobStatus=status,
+                    )
                 )
-            )
-    except botocore.exceptions.ClientError as e:
-        code = e.response["Error"]["Code"]
-        if code in ("InvalidJobQueueException",):
+        except botocore.exceptions.ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("InvalidJobQueueException",):
+                console.print(
+                    f"[bold red]Error:[/bold red] Job queue '{queue}' does not exist"
+                )
+            else:
+                console.print(
+                    f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
+                )
+            sys.exit(1)
+
+        matching = [j for j in jobs if j["jobName"] == job_name]
+        if not matching:
             console.print(
-                f"[bold red]Error:[/bold red] Job queue '{queue}' does not exist"
+                f"[bold red]Error:[/bold red] No job named '{job_name}' found in queue '{queue}'"
             )
-        else:
+            sys.exit(1)
+
+        # Most recent first
+        most_recent = max(matching, key=lambda j: j["createdAt"])
+
+        # Describe job to get log stream
+        try:
+            describe_resp = batch.describe_jobs(jobs=[most_recent["jobId"]])
+        except botocore.exceptions.ClientError as e:
             console.print(
                 f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
             )
-        sys.exit(1)
+            sys.exit(1)
 
-    matching = [j for j in jobs if j["jobName"] == job_name]
-    if not matching:
-        console.print(
-            f"[bold red]Error:[/bold red] No job named '{job_name}' found in queue '{queue}'"
-        )
-        sys.exit(1)
+        job_detail = describe_resp["jobs"][0]
+        log_stream = job_detail.get("container", {}).get("logStreamName")
 
-    # Most recent first
-    most_recent = max(matching, key=lambda j: j["createdAt"])
+        if not log_stream:
+            console.print(
+                f"No log stream available for this job (status: {job_detail.get('status', 'UNKNOWN')})"
+            )
+            sys.exit(0)
 
-    # Describe job to get log stream
-    try:
-        describe_resp = batch.describe_jobs(jobs=[most_recent["jobId"]])
-    except botocore.exceptions.ClientError as e:
-        console.print(
-            f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
-        )
-        sys.exit(1)
+        logs_client = session.client("logs")
+        log_group = "/aws/batch/job"
 
-    job_detail = describe_resp["jobs"][0]
-    log_stream = job_detail.get("container", {}).get("logStreamName")
-
-    if not log_stream:
-        console.print(
-            f"No log stream available for this job (status: {job_detail.get('status', 'UNKNOWN')})"
-        )
-        sys.exit(0)
-
-    logs_client = session.client("logs")
-    log_group = "/aws/batch/job"
-
-    try:
-        events: list[dict[str, Any]] = []
-        response = logs_client.get_log_events(
-            logGroupName=log_group,
-            logStreamName=log_stream,
-            startFromHead=True,
-        )
-        events.extend(response.get("events", []))
-        prev_token = response.get("nextForwardToken")
-        while True:
+        try:
+            events: list[dict[str, Any]] = []
             response = logs_client.get_log_events(
                 logGroupName=log_group,
                 logStreamName=log_stream,
                 startFromHead=True,
-                nextToken=prev_token,
             )
-            next_token = response.get("nextForwardToken")
             events.extend(response.get("events", []))
-            if next_token == prev_token:
-                break
-            prev_token = next_token
-    except botocore.exceptions.ClientError as e:
-        console.print(
-            f"[bold red]Error:[/bold red] CloudWatch Logs API error: {e.response['Error']['Message']} (log group: {log_group})"
-        )
-        sys.exit(1)
+            prev_token = response.get("nextForwardToken")
+            while True:
+                response = logs_client.get_log_events(
+                    logGroupName=log_group,
+                    logStreamName=log_stream,
+                    startFromHead=True,
+                    nextToken=prev_token,
+                )
+                next_token = response.get("nextForwardToken")
+                events.extend(response.get("events", []))
+                if next_token == prev_token:
+                    break
+                prev_token = next_token
+        except botocore.exceptions.ClientError as e:
+            console.print(
+                f"[bold red]Error:[/bold red] CloudWatch Logs API error: {e.response['Error']['Message']} (log group: {log_group})"
+            )
+            sys.exit(1)
 
     for event in events:
         ts = _ms_to_utc(event["timestamp"]).isoformat()
@@ -283,39 +284,42 @@ def list_queues(ctx: click.Context) -> None:
     \b
     Example:
         nextflow-aws-logs list-queues
+
     """
-    session: boto3.Session = ctx.obj["session"]
-    batch = session.client("batch")
+    
+    with console.status("Getting queues..."):
+        session: boto3.Session = ctx.obj["session"]
+        batch = session.client("batch")
 
-    try:
-        queues = _paginate_batch(batch, "describe_job_queues", "jobQueues")
-    except botocore.exceptions.ClientError as e:
-        console.print(
-            f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
-        )
-        sys.exit(1)
-
-    if not queues:
-        console.print("No job queues found in this account and region")
-        sys.exit(0)
-
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Queue Name")
-    table.add_column("State")
-    table.add_column("Running Jobs")
-
-    for queue in queues:
-        name = queue["jobQueueName"]
-        state = queue.get("state", "UNKNOWN")
         try:
-            running_jobs = _paginate_batch(
-                batch, "list_jobs", "jobSummaryList", jobQueue=name, jobStatus="RUNNING"
+            queues = _paginate_batch(batch, "describe_job_queues", "jobQueues")
+        except botocore.exceptions.ClientError as e:
+            console.print(
+                f"[bold red]Error:[/bold red] AWS Batch API error: {e.response['Error']['Message']}"
             )
-            running_count = str(len(running_jobs))
-        except botocore.exceptions.ClientError:
-            running_count = "N/A"
+            sys.exit(1)
 
-        table.add_row(name, state, running_count)
+        if not queues:
+            console.print("No job queues found in this account and region")
+            sys.exit(0)
+
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Queue Name")
+        table.add_column("State")
+        table.add_column("Running Jobs")
+
+        for queue in queues:
+            name = queue["jobQueueName"]
+            state = queue.get("state", "UNKNOWN")
+            try:
+                running_jobs = _paginate_batch(
+                    batch, "list_jobs", "jobSummaryList", jobQueue=name, jobStatus="RUNNING"
+                )
+                running_count = str(len(running_jobs))
+            except botocore.exceptions.ClientError:
+                running_count = "N/A"
+
+            table.add_row(name, state, running_count)
 
     console.print(table)
 

@@ -374,10 +374,9 @@ class TestListCommandResults:
         """Empty result set shows table with no data rows, exits 0 (Req 2.8)."""
         result, _ = self._invoke_list(["--queue", "q", "--now"])
         assert result.exit_code == 0
-        assert "Job Name" in result.output
-        assert "Job ID" in result.output
+        assert "Job name" in result.output
         assert "Status" in result.output
-        assert "Created At" in result.output
+        assert "Created at" in result.output
 
     def test_non_empty_result_shows_job_details(self):
         """Job name, ID, status, and formatted timestamp appear in the table (Req 2.7)."""
@@ -394,7 +393,6 @@ class TestListCommandResults:
         )
         assert result.exit_code == 0
         assert "my-job" in result.output
-        assert "abc-123" in result.output
         assert "RUNNING" in result.output
         assert "2001-09-09" in result.output
 
